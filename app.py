@@ -1,13 +1,20 @@
 """
-Network Traffic Monitoring and Analysis Platform
-Backend: Flask + simulated traffic dataset
+PacketScope - Real-Time Network Traffic Monitor
+Backend: Python + Flask + Scapy (live packet capture)
+
+Run as Administrator on Windows / sudo on Linux:
+    Windows: python app.py
+    Linux:   sudo python3 app.py
+
+Install dependencies:
+    pip install flask scapy
 """
 
 from flask import Flask, jsonify, request, render_template
-import random
-import time
-from datetime import datetime, timedelta
+from scapy.all import sniff, IP, TCP, UDP, ICMP, get_if_list
 import threading
+import time
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -22,64 +29,83 @@ PORT_SERVICES = {
     27017: "MongoDB",
 }
 
-WELL_KNOWN_PORTS = list(PORT_SERVICES.keys())
-PROTOCOLS = ["TCP", "UDP", "ICMP"]
-PROTOCOL_WEIGHTS = [0.60, 0.30, 0.10]
-
-SAMPLE_IPS = [
-    "192.168.1.1", "192.168.1.5", "192.168.1.10", "192.168.1.50",
-    "192.168.0.2", "10.0.0.1", "10.0.0.15", "172.16.0.5",
-    "8.8.8.8", "8.8.4.4", "1.1.1.1", "142.250.185.46",
-    "151.101.1.140", "104.21.8.15", "185.199.108.153",
-]
-
 # ─── Global state ────────────────────────────────────────────────────────────
-monitoring_active = False
-packet_log = []
-monitor_thread = None
-packet_counter = 0
-lock = threading.Lock()
+lock            = threading.Lock()
+packet_log      = []
+packet_counter  = 0
+monitoring      = False
+sniffer_thread  = None
 
-# ─── Traffic simulation ───────────────────────────────────────────────────────
-def generate_packet():
+# ─── Process each captured packet ────────────────────────────────────────────
+def process_packet(pkt):
     global packet_counter
-    protocol = random.choices(PROTOCOLS, weights=PROTOCOL_WEIGHTS)[0]
-    src_ip = random.choice(SAMPLE_IPS)
-    dst_ip = random.choice([ip for ip in SAMPLE_IPS if ip != src_ip])
 
-    if protocol == "ICMP":
-        src_port = 0
-        dst_port = 0
+    # Only process packets that have an IP layer
+    if not pkt.haslayer(IP):
+        return
+
+    ip    = pkt[IP]
+    proto = ""
+    src_port = 0
+    dst_port = 0
+    service  = "Unknown"
+
+    if pkt.haslayer(TCP):
+        proto    = "TCP"
+        src_port = pkt[TCP].sport
+        dst_port = pkt[TCP].dport
+        service  = PORT_SERVICES.get(dst_port,
+                   PORT_SERVICES.get(src_port, "Unknown"))
+
+    elif pkt.haslayer(UDP):
+        proto    = "UDP"
+        src_port = pkt[UDP].sport
+        dst_port = pkt[UDP].dport
+        service  = PORT_SERVICES.get(dst_port,
+                   PORT_SERVICES.get(src_port, "Unknown"))
+
+    elif pkt.haslayer(ICMP):
+        proto   = "ICMP"
         service = "ICMP"
+
     else:
-        dst_port = random.choice(WELL_KNOWN_PORTS + [random.randint(1024, 65535)])
-        src_port = random.randint(1024, 65535)
-        service = PORT_SERVICES.get(dst_port, f"Unknown({dst_port})")
+        # Skip non TCP/UDP/ICMP packets
+        return
+
+    # Get actual packet size
+    pkt_size = len(pkt)
 
     packet_counter += 1
-    return {
-        "id": packet_counter,
-        "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-        "src_ip": src_ip,
-        "dst_ip": dst_ip,
-        "protocol": protocol,
-        "src_port": src_port,
-        "dst_port": dst_port,
-        "service": service,
-        "packet_size": random.randint(40, 1500),
+    record = {
+        "id":          packet_counter,
+        "time":        datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "src_ip":      ip.src,
+        "dst_ip":      ip.dst,
+        "protocol":    proto,
+        "src_port":    src_port,
+        "dst_port":    dst_port,
+        "service":     service,
+        "packet_size": pkt_size,
     }
 
-def simulate_traffic():
-    global monitoring_active, packet_log
-    while monitoring_active:
-        packets_this_tick = random.randint(1, 4)
-        with lock:
-            for _ in range(packets_this_tick):
-                pkt = generate_packet()
-                packet_log.append(pkt)
-                if len(packet_log) > 1000:  # cap memory
-                    packet_log = packet_log[-1000:]
-        time.sleep(random.uniform(0.4, 1.0))
+    with lock:
+        packet_log.append(record)
+        if len(packet_log) > 1000:
+            packet_log.pop(0)
+
+# ─── Sniffer thread ───────────────────────────────────────────────────────────
+def start_sniffing():
+    """
+    Runs Scapy's sniff() in a background thread.
+    stop_filter checks the monitoring flag every packet
+    so sniffing stops cleanly when the user clicks Stop.
+    """
+    sniff(
+        prn=process_packet,
+        store=False,                          # don't keep packets in memory
+        stop_filter=lambda p: not monitoring, # stop when monitoring = False
+        filter="ip",                          # only capture IP packets
+    )
 
 # ─── API Routes ───────────────────────────────────────────────────────────────
 
@@ -89,29 +115,33 @@ def index():
 
 @app.route("/api/start", methods=["POST"])
 def start_monitoring():
-    global monitoring_active, monitor_thread, packet_log, packet_counter
-    if monitoring_active:
+    global monitoring, sniffer_thread, packet_log, packet_counter
+
+    if monitoring:
         return jsonify({"status": "already_running"})
-    monitoring_active = True
-    packet_log = []
+
+    monitoring     = True
+    packet_log     = []
     packet_counter = 0
-    monitor_thread = threading.Thread(target=simulate_traffic, daemon=True)
-    monitor_thread.start()
+
+    sniffer_thread = threading.Thread(target=start_sniffing, daemon=True)
+    sniffer_thread.start()
+
     return jsonify({"status": "started"})
 
 @app.route("/api/stop", methods=["POST"])
 def stop_monitoring():
-    global monitoring_active
-    monitoring_active = False
+    global monitoring
+    monitoring = False
     return jsonify({"status": "stopped"})
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
-    return jsonify({"monitoring": monitoring_active})
+    return jsonify({"monitoring": monitoring})
 
 @app.route("/api/packets", methods=["GET"])
 def get_packets():
-    protocol = request.args.get("protocol", "").upper()
+    protocol = request.args.get("protocol", "ALL").upper()
     src_ip   = request.args.get("src_ip", "").strip()
     dst_ip   = request.args.get("dst_ip", "").strip()
     after_id = int(request.args.get("after_id", 0))
@@ -119,15 +149,13 @@ def get_packets():
     with lock:
         results = list(packet_log)
 
-    # filter
-    if protocol and protocol != "ALL":
+    if protocol != "ALL":
         results = [p for p in results if p["protocol"] == protocol]
     if src_ip:
         results = [p for p in results if src_ip in p["src_ip"]]
     if dst_ip:
         results = [p for p in results if dst_ip in p["dst_ip"]]
 
-    # only return new packets (for live polling)
     new_packets = [p for p in results if p["id"] > after_id]
 
     return jsonify({"packets": new_packets})
@@ -139,39 +167,45 @@ def get_stats():
 
     total = len(data)
     proto_counts = {"TCP": 0, "UDP": 0, "ICMP": 0}
-    total_size = 0
+    total_size   = 0
+    top_src      = {}
+    top_services = {}
 
     for p in data:
         proto_counts[p["protocol"]] = proto_counts.get(p["protocol"], 0) + 1
         total_size += p["packet_size"]
+        top_src[p["src_ip"]]       = top_src.get(p["src_ip"], 0) + 1
+        top_services[p["service"]] = top_services.get(p["service"], 0) + 1
 
     avg_size = round(total_size / total, 1) if total else 0
 
-    top_src = {}
-    for p in data:
-        top_src[p["src_ip"]] = top_src.get(p["src_ip"], 0) + 1
-    top_src_sorted = sorted(top_src.items(), key=lambda x: -x[1])[:5]
-
-    top_services = {}
-    for p in data:
-        top_services[p["service"]] = top_services.get(p["service"], 0) + 1
-    top_services_sorted = sorted(top_services.items(), key=lambda x: -x[1])[:5]
+    top_src_sorted = sorted(top_src.items(),      key=lambda x: -x[1])[:5]
+    top_svc_sorted = sorted(top_services.items(), key=lambda x: -x[1])[:5]
 
     return jsonify({
-        "total_packets": total,
+        "total_packets":   total,
         "protocol_counts": proto_counts,
         "avg_packet_size": avg_size,
-        "top_sources": top_src_sorted,
-        "top_services": top_services_sorted,
-        "monitoring": monitoring_active,
+        "top_sources":     top_src_sorted,
+        "top_services":    top_svc_sorted,
+        "monitoring":      monitoring,
     })
 
-@app.route("/api/dataset", methods=["GET"])
-def get_dataset():
-    """Returns the full raw log as CSV-style for download/report."""
-    with lock:
-        data = list(packet_log)
-    return jsonify({"dataset": data, "count": len(data)})
+@app.route("/api/interfaces", methods=["GET"])
+def get_interfaces():
+    """Returns list of available network interfaces on this machine."""
+    try:
+        interfaces = get_if_list()
+        return jsonify({"interfaces": interfaces})
+    except Exception as e:
+        return jsonify({"interfaces": [], "error": str(e)})
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5050)
+    print("=" * 45)
+    print("  PacketScope - Real-Time Traffic Monitor")
+    print("=" * 45)
+    print("  IMPORTANT: Run as Administrator (Windows)")
+    print("             or with sudo (Linux/Mac)")
+    print("  Open: http://localhost:5050")
+    print("=" * 45)
+    app.run(debug=False, port=5050)
